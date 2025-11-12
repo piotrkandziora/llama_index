@@ -1077,13 +1077,19 @@ class OpensearchVectorClient:
                 "search_pipeline": self._search_pipeline,
             }
         elif query_mode == VectorStoreQueryMode.SEMANTIC_HYBRID:
-            if query_str is None or self._search_pipeline is None:
+            if query_str is None:
                 raise ValueError(
-                    "Please specify query_str and search_pipeline for semantic hybrid search."
+                    "SEMANTIC_HYBRID mode requires query_str (text query)."
+                )
+            if self._search_pipeline is None:
+                raise ValueError(
+                    "SEMANTIC_HYBRID mode requires search_pipeline. "
+                    "Pass search_pipeline parameter to OpensearchVectorClient."
                 )
             if self._model_id is None:
                 raise ValueError(
-                    "Please specify model_id in OpensearchVectorClient for semantic hybrid search."
+                    "SEMANTIC_HYBRID mode requires model_id. "
+                    "Pass model_id parameter to OpensearchVectorClient."
                 )
             search_query = self._neural_hybrid_search_query(
                 self._text_field,
@@ -1146,13 +1152,19 @@ class OpensearchVectorClient:
                 "search_pipeline": self._search_pipeline,
             }
         elif query_mode == VectorStoreQueryMode.SEMANTIC_HYBRID:
-            if query_str is None or self._search_pipeline is None:
+            if query_str is None:
                 raise ValueError(
-                    "Please specify query_str and search_pipeline for semantic hybrid search."
+                    "SEMANTIC_HYBRID mode requires query_str (text query)."
+                )
+            if self._search_pipeline is None:
+                raise ValueError(
+                    "SEMANTIC_HYBRID mode requires search_pipeline. "
+                    "Pass search_pipeline parameter to OpensearchVectorClient."
                 )
             if self._model_id is None:
                 raise ValueError(
-                    "Please specify model_id in OpensearchVectorClient for semantic hybrid search."
+                    "SEMANTIC_HYBRID mode requires model_id. "
+                    "Pass model_id parameter to OpensearchVectorClient."
                 )
             search_query = self._neural_hybrid_search_query(
                 self._text_field,
