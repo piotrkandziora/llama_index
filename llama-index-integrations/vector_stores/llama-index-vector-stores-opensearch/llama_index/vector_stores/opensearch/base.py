@@ -56,6 +56,13 @@ class OpensearchVectorClient:
         settings: Optional[dict]: Settings for the Opensearch index creation. Defaults to:
             {"index": {"knn": True, "knn.algo_param.ef_search": 100}}
         space_type (Optional[str]): space type for distance metric calculation. Defaults to: l2
+        search_pipeline (Optional[str]): Name of the search pipeline to use for hybrid search.
+            Required for HYBRID and SEMANTIC_HYBRID query modes.
+        model_id (Optional[str]): ID of the ML model deployed in OpenSearch for neural search.
+            Required for SEMANTIC_HYBRID query mode which uses server-side embeddings.
+        ingest_pipeline (Optional[str]): Name of the ingest pipeline for neural ingestion.
+            If provided, documents are ingested WITHOUT client-side embeddings.
+            The pipeline must have a text_embedding processor with the same model_id.
         os_client (Optional[OSClient]): Custom synchronous client (see OpenSearch from opensearch-py)
         os_async_client (Optional[OSClient]): Custom asynchronous client (see AsyncOpenSearch from opensearch-py)
         excluded_source_fields (Optional[List[str]]): Optional list of document "source" fields to exclude from OpenSearch responses.
@@ -76,6 +83,8 @@ class OpensearchVectorClient:
         space_type: Optional[str] = "l2",
         max_chunk_bytes: int = 1 * 1024 * 1024,
         search_pipeline: Optional[str] = None,
+        model_id: Optional[str] = None,
+        ingest_pipeline: Optional[str] = None,
         os_client: Optional[OSClient] = None,
         os_async_client: Optional[OSClient] = None,
         excluded_source_fields: Optional[List[str]] = None,
@@ -104,6 +113,8 @@ class OpensearchVectorClient:
         self._excluded_source_fields = excluded_source_fields
 
         self._search_pipeline = search_pipeline
+        self._model_id = model_id
+        self._ingest_pipeline = ingest_pipeline
         http_auth = kwargs.get("http_auth")
         self.space_type = space_type
         self.is_aoss = self._is_aoss_enabled(http_auth=http_auth)
@@ -223,6 +234,63 @@ class OpensearchVectorClient:
         info = self._os_client.info()
         return info["version"]["number"]
 
+    def _bulk_ingest_text(
+        self,
+        client: Any,
+        index_name: str,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        text_field: str = "content",
+        pipeline: str = None,
+        max_chunk_bytes: Optional[int] = 1 * 1024 * 1024,
+        is_aoss: bool = False,
+    ) -> List[str]:
+        """
+        Bulk ingest text documents for neural ingestion.
+
+        Documents are sent WITHOUT embeddings. The ingest pipeline
+        will generate embeddings server-side using text_embedding processor.
+        """
+        bulk = self._import_bulk()
+        not_found_error = self._import_not_found_error()
+        requests = []
+        return_ids = []
+
+        try:
+            client.indices.get(index=index_name)
+        except not_found_error:
+            # Index doesn't exist - create it without requiring embeddings upfront
+            # The pipeline will add embeddings
+            client.indices.create(index=index_name)
+
+        for i, text in enumerate(texts):
+            metadata = metadatas[i] if metadatas else {}
+            _id = ids[i] if ids else str(uuid.uuid4())
+            request = {
+                "_op_type": "index",
+                "_index": index_name,
+                text_field: text,
+                "metadata": metadata,
+            }
+            if is_aoss:
+                request["id"] = _id
+            else:
+                request["_id"] = _id
+
+            # Add pipeline parameter for this request
+            if pipeline:
+                request["pipeline"] = pipeline
+
+            requests.append(request)
+            return_ids.append(_id)
+
+        bulk(client, requests, max_chunk_bytes=max_chunk_bytes)
+        if not is_aoss:
+            client.indices.refresh(index=index_name)
+
+        return return_ids
+
     def _bulk_ingest_embeddings(
         self,
         client: Any,
@@ -271,6 +339,63 @@ class OpensearchVectorClient:
         bulk(client, requests, max_chunk_bytes=max_chunk_bytes)
         if not is_aoss:
             client.indices.refresh(index=index_name)
+
+        return return_ids
+
+    async def _abulk_ingest_text(
+        self,
+        client: Any,
+        index_name: str,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        text_field: str = "content",
+        pipeline: str = None,
+        max_chunk_bytes: Optional[int] = 1 * 1024 * 1024,
+        is_aoss: bool = False,
+    ) -> List[str]:
+        """
+        Async bulk ingest text documents for neural ingestion.
+
+        Documents are sent WITHOUT embeddings. The ingest pipeline
+        will generate embeddings server-side using text_embedding processor.
+        """
+        async_bulk = self._import_async_bulk()
+        not_found_error = self._import_not_found_error()
+        requests = []
+        return_ids = []
+
+        try:
+            await client.indices.get(index=index_name)
+        except not_found_error:
+            # Index doesn't exist - create it without requiring embeddings upfront
+            # The pipeline will add embeddings
+            await client.indices.create(index=index_name)
+
+        for i, text in enumerate(texts):
+            metadata = metadatas[i] if metadatas else {}
+            _id = ids[i] if ids else str(uuid.uuid4())
+            request = {
+                "_op_type": "index",
+                "_index": index_name,
+                text_field: text,
+                "metadata": metadata,
+            }
+            if is_aoss:
+                request["id"] = _id
+            else:
+                request["_id"] = _id
+
+            # Add pipeline parameter for this request
+            if pipeline:
+                request["pipeline"] = pipeline
+
+            requests.append(request)
+            return_ids.append(_id)
+
+        await async_bulk(client, requests, max_chunk_bytes=max_chunk_bytes)
+        if not is_aoss:
+            await client.indices.refresh(index=index_name)
 
         return return_ids
 
@@ -551,6 +676,34 @@ class OpensearchVectorClient:
             query["_source"] = {"exclude": excluded_source_fields}
         return query
 
+    def _neural_hybrid_search_query(
+        self,
+        text_field: str,
+        query_str: str,
+        embedding_field: str,
+        model_id: str,
+        k: int,
+        filters: Optional[MetadataFilters] = None,
+        excluded_source_fields: Optional[List[str]] = None,
+    ) -> Dict:
+        """
+        Create a neural hybrid search query combining lexical and neural queries.
+
+        This uses OpenSearch's neural plugin for server-side embeddings.
+        """
+        neural_query = self._neural_search_query(embedding_field, query_str, model_id, k, filters)
+        lexical_query = self._lexical_search_query(text_field, query_str, k, filters)
+
+        query = {
+            "size": k,
+            "query": {
+                "hybrid": {"queries": [lexical_query["query"], neural_query["query"]]}
+            },
+        }
+        if excluded_source_fields:
+            query["_source"] = {"exclude": excluded_source_fields}
+        return query
+
     def _lexical_search_query(
         self,
         text_field: str,
@@ -570,6 +723,49 @@ class OpensearchVectorClient:
         query = {
             "size": k,
             "query": lexical_query,
+        }
+        if excluded_source_fields:
+            query["_source"] = {"exclude": excluded_source_fields}
+        return query
+
+    def _neural_search_query(
+        self,
+        embedding_field: str,
+        query_str: str,
+        model_id: str,
+        k: int,
+        filters: Optional[MetadataFilters] = None,
+        excluded_source_fields: Optional[List[str]] = None,
+    ) -> Dict:
+        """
+        Create a neural search query for OpenSearch ML models.
+
+        Uses the 'neural' query type which computes embeddings server-side
+        using an OpenSearch ML model.
+        """
+        neural_query = {
+            "neural": {
+                embedding_field: {
+                    "query_text": query_str,
+                    "model_id": model_id,
+                    "k": k,
+                }
+            }
+        }
+
+        parsed_filters = self._parse_filters(filters)
+        if len(parsed_filters) > 0:
+            # Wrap neural query with bool filter
+            neural_query = {
+                "bool": {
+                    "must": neural_query,
+                    "filter": parsed_filters
+                }
+            }
+
+        query = {
+            "size": k,
+            "query": neural_query,
         }
         if excluded_source_fields:
             query["_source"] = {"exclude": excluded_source_fields}
@@ -677,55 +873,89 @@ class OpensearchVectorClient:
 
     def index_results(self, nodes: List[BaseNode], **kwargs: Any) -> List[str]:
         """Store results in the index."""
-        embeddings: List[List[float]] = []
         texts: List[str] = []
         metadatas: List[dict] = []
         ids: List[str] = []
         for node in nodes:
             ids.append(node.node_id)
-            embeddings.append(node.get_embedding())
             texts.append(node.get_content(metadata_mode=MetadataMode.NONE))
             metadatas.append(node_to_metadata_dict(node, remove_text=True))
 
-        return self._bulk_ingest_embeddings(
-            self._os_client,
-            self._index,
-            embeddings,
-            texts,
-            metadatas=metadatas,
-            ids=ids,
-            vector_field=self._embedding_field,
-            text_field=self._text_field,
-            mapping=None,
-            max_chunk_bytes=self._max_chunk_bytes,
-            is_aoss=self.is_aoss,
-        )
+        # If ingest_pipeline is set, use neural ingestion (no client-side embeddings)
+        if self._ingest_pipeline:
+            return self._bulk_ingest_text(
+                self._os_client,
+                self._index,
+                texts,
+                metadatas=metadatas,
+                ids=ids,
+                text_field=self._text_field,
+                pipeline=self._ingest_pipeline,
+                max_chunk_bytes=self._max_chunk_bytes,
+                is_aoss=self.is_aoss,
+            )
+        else:
+            # Traditional ingestion with client-side embeddings
+            embeddings: List[List[float]] = []
+            for node in nodes:
+                embeddings.append(node.get_embedding())
+
+            return self._bulk_ingest_embeddings(
+                self._os_client,
+                self._index,
+                embeddings,
+                texts,
+                metadatas=metadatas,
+                ids=ids,
+                vector_field=self._embedding_field,
+                text_field=self._text_field,
+                mapping=None,
+                max_chunk_bytes=self._max_chunk_bytes,
+                is_aoss=self.is_aoss,
+            )
 
     async def aindex_results(self, nodes: List[BaseNode], **kwargs: Any) -> List[str]:
         """Store results in the index."""
-        embeddings: List[List[float]] = []
         texts: List[str] = []
         metadatas: List[dict] = []
         ids: List[str] = []
         for node in nodes:
             ids.append(node.node_id)
-            embeddings.append(node.get_embedding())
             texts.append(node.get_content(metadata_mode=MetadataMode.NONE))
             metadatas.append(node_to_metadata_dict(node, remove_text=True))
 
-        return await self._abulk_ingest_embeddings(
-            self._os_async_client,
-            self._index,
-            embeddings,
-            texts,
-            metadatas=metadatas,
-            ids=ids,
-            vector_field=self._embedding_field,
-            text_field=self._text_field,
-            mapping=None,
-            max_chunk_bytes=self._max_chunk_bytes,
-            is_aoss=self.is_aoss,
-        )
+        # If ingest_pipeline is set, use neural ingestion (no client-side embeddings)
+        if self._ingest_pipeline:
+            return await self._abulk_ingest_text(
+                self._os_async_client,
+                self._index,
+                texts,
+                metadatas=metadatas,
+                ids=ids,
+                text_field=self._text_field,
+                pipeline=self._ingest_pipeline,
+                max_chunk_bytes=self._max_chunk_bytes,
+                is_aoss=self.is_aoss,
+            )
+        else:
+            # Traditional ingestion with client-side embeddings
+            embeddings: List[List[float]] = []
+            for node in nodes:
+                embeddings.append(node.get_embedding())
+
+            return await self._abulk_ingest_embeddings(
+                self._os_async_client,
+                self._index,
+                embeddings,
+                texts,
+                metadatas=metadatas,
+                ids=ids,
+                vector_field=self._embedding_field,
+                text_field=self._text_field,
+                mapping=None,
+                max_chunk_bytes=self._max_chunk_bytes,
+                is_aoss=self.is_aoss,
+            )
 
     def delete_by_doc_id(self, doc_id: str) -> None:
         """
@@ -846,6 +1076,27 @@ class OpensearchVectorClient:
             params = {
                 "search_pipeline": self._search_pipeline,
             }
+        elif query_mode == VectorStoreQueryMode.SEMANTIC_HYBRID:
+            if query_str is None or self._search_pipeline is None:
+                raise ValueError(
+                    "Please specify query_str and search_pipeline for semantic hybrid search."
+                )
+            if self._model_id is None:
+                raise ValueError(
+                    "Please specify model_id in OpensearchVectorClient for semantic hybrid search."
+                )
+            search_query = self._neural_hybrid_search_query(
+                self._text_field,
+                query_str,
+                self._embedding_field,
+                self._model_id,
+                k,
+                filters=filters,
+                excluded_source_fields=self._excluded_source_fields,
+            )
+            params = {
+                "search_pipeline": self._search_pipeline,
+            }
         elif query_mode == VectorStoreQueryMode.TEXT_SEARCH:
             search_query = self._lexical_search_query(
                 self._text_field,
@@ -887,6 +1138,27 @@ class OpensearchVectorClient:
                 query_str,
                 self._embedding_field,
                 query_embedding,
+                k,
+                filters=filters,
+                excluded_source_fields=self._excluded_source_fields,
+            )
+            params = {
+                "search_pipeline": self._search_pipeline,
+            }
+        elif query_mode == VectorStoreQueryMode.SEMANTIC_HYBRID:
+            if query_str is None or self._search_pipeline is None:
+                raise ValueError(
+                    "Please specify query_str and search_pipeline for semantic hybrid search."
+                )
+            if self._model_id is None:
+                raise ValueError(
+                    "Please specify model_id in OpensearchVectorClient for semantic hybrid search."
+                )
+            search_query = self._neural_hybrid_search_query(
+                self._text_field,
+                query_str,
+                self._embedding_field,
+                self._model_id,
                 k,
                 filters=filters,
                 excluded_source_fields=self._excluded_source_fields,
